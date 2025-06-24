@@ -4,510 +4,183 @@ const InternetService = require('../models/InternetService'); // ✅ CORRECTO
 const User = require('../models/User');
 const Invoice = require('../models/Invoice');
 
-// Obtener pagos con filtros y paginación
+// Obtener todos los pagos (admin) o pagos del usuario
 exports.getPayments = async (req, res) => {
     try {
-        const { 
-            page = 1, 
-            limit = 10, 
-            status, 
-            paymentMethod,
-            clientId,
-            startDate,
-            endDate,
-            search,
-            sortBy = 'paymentDate',
-            sortOrder = 'desc'
-        } = req.query;
+        let payments;
         
-        // Construir filtros según el rol
-        let filters = {};
-        
-        if (req.user.role === 'client') {
-            // Clientes solo ven sus pagos
-            filters.client = req.user.id;
-        } else if (['billing', 'operator'].includes(req.user.role)) {
-            // Billing puede filtrar por cliente específico
-            if (clientId) filters.client = clientId;
-        }
-        // Admin y supervisores ven todos sin restricción
-        
-        // Aplicar filtros adicionales
-        if (status) filters.status = status;
-        if (paymentMethod) filters.paymentMethod = paymentMethod;
-        if (startDate || endDate) {
-            filters.paymentDate = {};
-            if (startDate) filters.paymentDate.$gte = new Date(startDate);
-            if (endDate) filters.paymentDate.$lte = new Date(endDate);
-        }
-        if (search) {
-            filters.$or = [
-                { receiptNumber: { $regex: search, $options: 'i' } },
-                { 'paymentDetails.transactionId': { $regex: search, $options: 'i' } }
-            ];
+        if (req.user.role === 'admin') {
+            payments = await Payment.find()
+                .populate('client', 'name email')
+                .populate('service', 'plan monthlyCost')
+                .sort({ paymentDate: -1 });
+        } else {
+            payments = await Payment.find({ client: req.user.id })
+                .populate('service', 'plan monthlyCost')
+                .sort({ paymentDate: -1 });
         }
         
-        // Opciones de paginación
-        const options = {
-            page: parseInt(page),
-            limit: parseInt(limit),
-            sort: { [sortBy]: sortOrder === 'desc' ? -1 : 1 }
-        };
-        
-        const payments = await Payment.find(filters)
-            .populate('client', 'name email phone clientInfo.customerCode')
-            .populate('services.service', 'serviceCode plan')
-            .populate('processedBy', 'name employeeInfo.employeeId')
-            .sort(options.sort)
-            .limit(options.limit * 1)
-            .skip((options.page - 1) * options.limit);
-            
-        const total = await Payment.countDocuments(filters);
-        
-        res.json({
-            success: true,
-            payments,
-            pagination: {
-                currentPage: options.page,
-                totalPages: Math.ceil(total / options.limit),
-                totalPayments: total,
-                hasNext: options.page < Math.ceil(total / options.limit),
-                hasPrev: options.page > 1
-            }
-        });
-        
+        res.json(payments);
     } catch (error) {
-        console.error('Error obteniendo pagos:', error);
-        res.status(500).json({ 
-            msg: 'Error del servidor',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
     }
 };
 
 // Obtener un pago específico
 exports.getPayment = async (req, res) => {
     try {
-        const paymentId = req.params.id;
-        
-        const payment = await Payment.findById(paymentId)
-            .populate('client', 'name email phone clientInfo address billingInfo')
-            .populate('services.service', 'serviceCode plan status')
-            .populate('processedBy', 'name employeeInfo')
-            .populate('approvedBy', 'name employeeInfo');
+        const payment = await Payment.findById(req.params.id)
+            .populate('client', 'name email')
+            .populate('service', 'plan monthlyCost');
         
         if (!payment) {
             return res.status(404).json({ msg: 'Pago no encontrado' });
         }
         
-        // Verificar permisos
-        if (req.user.role === 'client' && payment.client._id.toString() !== req.user.id) {
-            return res.status(403).json({ msg: 'No autorizado para ver este pago' });
+        // Verificar que el pago pertenezca al usuario o sea admin
+        if (payment.client._id.toString() !== req.user.id && req.user.role !== 'admin') {
+            return res.status(401).json({ msg: 'No autorizado' });
         }
         
-        res.json({
-            success: true,
-            payment
-        });
-        
+        res.json(payment);
     } catch (error) {
-        console.error('Error obteniendo pago:', error);
-        res.status(500).json({ msg: 'Error del servidor' });
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
     }
 };
 
-// Crear nuevo pago/recibo
+// Crear nuevo pago
 exports.createPayment = async (req, res) => {
     try {
-        const errors = validationResult(req);
-        if (!errors.isEmpty()) {
-            return res.status(400).json({ 
-                msg: 'Datos de entrada inválidos',
-                errors: errors.array() 
-            });
-        }
-
-        // Solo admin, billing y supervisor pueden crear pagos
-        if (!['admin', 'supervisor', 'billing'].includes(req.user.role)) {
-            return res.status(403).json({ msg: 'Acceso denegado' });
-        }
-        
         const { 
-            client,
-            services,
-            additionalCharges,
-            discounts,
-            paymentMethod,
-            paymentDetails,
-            dueDate,
-            notes,
-            billingAddress
-        } = req.body;
-        
-        // Verificar que el cliente existe
-        const clientUser = await User.findById(client);
-        if (!clientUser || clientUser.role !== 'client') {
-            return res.status(400).json({ msg: 'Cliente no válido' });
-        }
-        
-        // Verificar que los servicios existen y pertenecen al cliente
-        const serviceIds = services.map(s => s.service);
-        const existingServices = await InternetService.find({
-            _id: { $in: serviceIds },
-            client: client
-        });
-        
-        if (existingServices.length !== services.length) {
-            return res.status(400).json({ 
-                msg: 'Algunos servicios no existen o no pertenecen al cliente' 
-            });
-        }
-        
-        // Crear datos del pago
-        const paymentData = {
-            client,
-            services: services.map(service => ({
-                service: service.service,
-                plan: service.plan,
-                amount: service.amount,
-                billingPeriod: {
-                    start: new Date(service.billingPeriod.start),
-                    end: new Date(service.billingPeriod.end)
-                }
-            })),
-            additionalCharges: additionalCharges || [],
-            discounts: discounts || [],
-            paymentMethod,
-            paymentDetails: paymentDetails || {},
-            dueDate: dueDate ? new Date(dueDate) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 días por defecto
-            billingAddress: billingAddress || clientUser.address,
-            processedBy: req.user.id,
-            notes: {
-                internal: notes?.internal,
-                customer: notes?.customer
-            }
-        };
-        
-        // Agregar impuestos si están configurados
-        const taxRate = process.env.TAX_RATE || 0.12; // 12% por defecto (Ecuador)
-        if (taxRate > 0) {
-            paymentData.taxes = [{
-                name: 'IVA',
-                rate: taxRate * 100,
-                amount: paymentData.taxableAmount * taxRate
-            }];
-        }
-        
-        const payment = new Payment(paymentData);
-        await payment.save();
-        
-        // Actualizar balances del cliente
-        await User.findByIdAndUpdate(
-            client,
-            { 
-                $inc: { 
-                    'billingInfo.currentBalance': payment.totalAmount
-                }
-            }
-        );
-        
-        // Poblar datos para respuesta
-        await payment.populate([
-            { path: 'client', select: 'name email clientInfo.customerCode' },
-            { path: 'services.service', select: 'serviceCode plan' },
-            { path: 'processedBy', select: 'name employeeInfo.employeeId' }
-        ]);
-        
-        res.status(201).json({
-            success: true,
-            msg: 'Pago/recibo creado exitosamente',
-            payment
-        });
-        
-    } catch (error) {
-        console.error('Error creando pago:', error);
-        
-        if (error.code === 11000) {
-            return res.status(400).json({ 
-                msg: 'Ya existe un pago con ese número de recibo' 
-            });
-        }
-        
-        res.status(500).json({ 
-            msg: 'Error del servidor',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
-    }
-};
-
-// Procesar pago (marcar como pagado)
-exports.processPayment = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { 
+            serviceId, 
+            amount, 
             paymentMethod, 
             transactionId, 
-            amount, 
-            bankName,
+            billingPeriod, 
             notes 
         } = req.body;
         
-        if (!['admin', 'supervisor', 'billing'].includes(req.user.role)) {
+        // Verificar que el servicio existe
+        const service = await InternetService.findById(serviceId);
+        if (!service) {
+            return res.status(404).json({ msg: 'Servicio no encontrado' });
+        }
+        
+        // Si no es admin, verificar que el servicio pertenezca al usuario
+        if (req.user.role !== 'admin' && service.client.toString() !== req.user.id) {
+            return res.status(401).json({ msg: 'No autorizado' });
+        }
+        
+        const newPayment = new Payment({
+            client: req.user.role === 'admin' ? service.client : req.user.id,
+            service: serviceId,
+            amount,
+            paymentMethod,
+            transactionId,
+            billingPeriod,
+            notes,
+            status: 'completed'
+        });
+        
+        const payment = await newPayment.save();
+        await payment.populate('client', 'name email');
+        await payment.populate('service', 'plan monthlyCost');
+        
+        res.json(payment);
+    } catch (error) {
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
+    }
+};
+
+// Actualizar estado de pago (solo admin)
+exports.updatePaymentStatus = async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') {
             return res.status(403).json({ msg: 'Acceso denegado' });
         }
         
-        const payment = await Payment.findById(id);
+        const { status, notes } = req.body;
+        
+        const payment = await Payment.findByIdAndUpdate(
+            req.params.id,
+            { status, notes },
+            { new: true }
+        ).populate('client', 'name email').populate('service', 'plan monthlyCost');
+        
         if (!payment) {
             return res.status(404).json({ msg: 'Pago no encontrado' });
         }
         
-        if (payment.status === 'completed') {
-            return res.status(400).json({ msg: 'El pago ya está completado' });
-        }
-        
-        // Procesar pago completo o parcial
-        const paidAmount = amount || payment.totalAmount;
-        
-        if (paidAmount >= payment.totalAmount) {
-            // Pago completo
-            payment.status = 'completed';
-            payment.paymentDate = new Date();
-            payment.paymentMethod = paymentMethod;
-            payment.paymentDetails = {
-                transactionId,
-                bankName,
-                ...payment.paymentDetails
-            };
-        } else {
-            // Pago parcial
-            await payment.addPartialPayment(paidAmount, paymentMethod, transactionId, notes);
-        }
-        
-        payment.processedBy = req.user.id;
-        if (notes) {
-            payment.notes.internal = payment.notes.internal ? 
-                `${payment.notes.internal}\n${new Date().toISOString()}: ${notes}` : notes;
-        }
-        
-        await payment.save();
-        
-        // Actualizar balance del cliente
-        await User.findByIdAndUpdate(
-            payment.client,
-            { 
-                $inc: { 
-                    'billingInfo.currentBalance': -paidAmount
-                }
-            }
-        );
-        
-        res.json({
-            success: true,
-            msg: payment.status === 'completed' ? 'Pago procesado exitosamente' : 'Pago parcial registrado',
-            payment: {
-                id: payment._id,
-                receiptNumber: payment.receiptNumber,
-                status: payment.status,
-                totalAmount: payment.totalAmount,
-                paidAmount: paidAmount
-            }
-        });
-        
+        res.json(payment);
     } catch (error) {
-        console.error('Error procesando pago:', error);
-        res.status(500).json({ msg: 'Error del servidor' });
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
     }
 };
 
-// Agregar pago parcial
-exports.addPartialPayment = async (req, res) => {
+// Obtener historial de pagos por servicio
+exports.getPaymentsByService = async (req, res) => {
     try {
-        const { id } = req.params;
-        const { amount, paymentMethod, transactionId, notes } = req.body;
+        const { serviceId } = req.params;
         
-        if (!['admin', 'supervisor', 'billing'].includes(req.user.role)) {
-            return res.status(403).json({ msg: 'Acceso denegado' });
+        // Verificar que el servicio existe
+        const service = await InternetService.findById(serviceId);
+        if (!service) {
+            return res.status(404).json({ msg: 'Servicio no encontrado' });
         }
         
-        const payment = await Payment.findById(id);
-        if (!payment) {
-            return res.status(404).json({ msg: 'Pago no encontrado' });
+        // Verificar permisos
+        if (req.user.role !== 'admin' && service.client.toString() !== req.user.id) {
+            return res.status(401).json({ msg: 'No autorizado' });
         }
         
-        if (payment.status === 'completed') {
-            return res.status(400).json({ msg: 'El pago ya está completado' });
-        }
+        const payments = await Payment.find({ service: serviceId })
+            .populate('client', 'name email')
+            .sort({ paymentDate: -1 });
         
-        await payment.addPartialPayment(amount, paymentMethod, transactionId, notes);
-        
-        res.json({
-            success: true,
-            msg: 'Pago parcial agregado exitosamente',
-            payment: {
-                id: payment._id,
-                status: payment.status,
-                partialPayments: payment.partialPayments
-            }
-        });
-        
+        res.json(payments);
     } catch (error) {
-        console.error('Error agregando pago parcial:', error);
-        res.status(500).json({ msg: 'Error del servidor' });
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
     }
 };
 
-// Procesar reembolso
-exports.processRefund = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { amount, reason } = req.body;
-        
-        if (!['admin', 'supervisor'].includes(req.user.role)) {
-            return res.status(403).json({ msg: 'Acceso denegado' });
-        }
-        
-        const payment = await Payment.findById(id);
-        if (!payment) {
-            return res.status(404).json({ msg: 'Pago no encontrado' });
-        }
-        
-        if (payment.status !== 'completed') {
-            return res.status(400).json({ msg: 'Solo se pueden reembolsar pagos completados' });
-        }
-        
-        if (payment.refund.isRefunded) {
-            return res.status(400).json({ msg: 'El pago ya fue reembolsado' });
-        }
-        
-        await payment.processRefund(amount || payment.totalAmount, reason, req.user.id);
-        
-        // Actualizar balance del cliente
-        await User.findByIdAndUpdate(
-            payment.client,
-            { 
-                $inc: { 
-                    'billingInfo.currentBalance': payment.refund.refundAmount
-                }
-            }
-        );
-        
-        res.json({
-            success: true,
-            msg: 'Reembolso procesado exitosamente',
-            refund: payment.refund
-        });
-        
-    } catch (error) {
-        console.error('Error procesando reembolso:', error);
-        res.status(500).json({ msg: 'Error del servidor' });
-    }
-};
-
-// Obtener pagos vencidos
-exports.getOverduePayments = async (req, res) => {
-    try {
-        if (!['admin', 'supervisor', 'billing', 'operator'].includes(req.user.role)) {
-            return res.status(403).json({ msg: 'Acceso denegado' });
-        }
-        
-        const overduePayments = await Payment.find({
-            status: 'pending',
-            dueDate: { $lt: new Date() }
-        })
-        .populate('client', 'name phone email clientInfo.customerCode address')
-        .populate('services.service', 'serviceCode status')
-        .sort({ dueDate: 1 });
-        
-        // Calcular días de mora para cada pago
-        const paymentsWithOverdue = overduePayments.map(payment => {
-            const daysOverdue = payment.getDaysOverdue();
-            return {
-                ...payment.toObject(),
-                daysOverdue
-            };
-        });
-        
-        res.json({
-            success: true,
-            overduePayments: paymentsWithOverdue,
-            count: overduePayments.length
-        });
-        
-    } catch (error) {
-        console.error('Error obteniendo pagos vencidos:', error);
-        res.status(500).json({ msg: 'Error del servidor' });
-    }
-};
-
-// Obtener estadísticas de pagos
+// Obtener estadísticas de pagos (solo admin)
 exports.getPaymentStats = async (req, res) => {
     try {
-        if (!['admin', 'supervisor', 'billing', 'operator'].includes(req.user.role)) {
+        if (req.user.role !== 'admin') {
             return res.status(403).json({ msg: 'Acceso denegado' });
         }
         
-        const { period = 'month' } = req.query;
         const now = new Date();
-        let startDate, endDate;
+        const thisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+        const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
         
-        switch (period) {
-            case 'today':
-                startDate = new Date(now.setHours(0, 0, 0, 0));
-                endDate = new Date(now.setHours(23, 59, 59, 999));
-                break;
-            case 'week':
-                startDate = new Date(now.setDate(now.getDate() - 7));
-                endDate = new Date();
-                break;
-            case 'month':
-                startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-                endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-                break;
-            case 'year':
-                startDate = new Date(now.getFullYear(), 0, 1);
-                endDate = new Date(now.getFullYear(), 11, 31);
-                break;
-            default:
-                startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-                endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        }
-        
-        const stats = await Payment.aggregate([
+        // Pagos de este mes
+        const thisMonthPayments = await Payment.aggregate([
             {
                 $match: {
-                    paymentDate: { $gte: startDate, $lte: endDate }
+                    paymentDate: { $gte: thisMonth },
+                    status: 'completed'
                 }
             },
             {
                 $group: {
                     _id: null,
-                    totalPayments: { $sum: 1 },
-                    totalAmount: { $sum: '$totalAmount' },
-                    completedPayments: {
-                        $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
-                    },
-                    completedAmount: {
-                        $sum: { $cond: [{ $eq: ['$status', 'completed'] }, '$totalAmount', 0] }
-                    },
-                    pendingPayments: {
-                        $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] }
-                    },
-                    pendingAmount: {
-                        $sum: { $cond: [{ $eq: ['$status', 'pending'] }, '$totalAmount', 0] }
-                    },
-                    failedPayments: {
-                        $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] }
-                    },
-                    totalTaxes: { $sum: '$totalTaxes' },
-                    totalDiscounts: { $sum: '$totalDiscounts' }
+                    total: { $sum: '$amount' },
+                    count: { $sum: 1 }
                 }
             }
         ]);
         
-        const paymentMethodStats = await Payment.aggregate([
+        // Pagos del mes anterior
+        const lastMonthPayments = await Payment.aggregate([
             {
                 $match: {
-                    paymentDate: { $gte: startDate, $lte: endDate },
+                    paymentDate: { $gte: lastMonth, $lt: thisMonth },
                     status: 'completed'
                 }
             },
@@ -653,31 +326,144 @@ exports.getClientPaymentHistory = async (req, res) => {
             {
                 $group: {
                     _id: null,
-                    totalPaid: {
-                        $sum: { $cond: [{ $eq: ['$status', 'completed'] }, '$totalAmount', 0] }
-                    },
-                    totalPending: {
-                        $sum: { $cond: [{ $eq: ['$status', 'pending'] }, '$totalAmount', 0] }
-                    },
-                    totalPayments: { $sum: 1 },
-                    lastPayment: { $max: '$paymentDate' }
+                    total: { $sum: '$amount' },
+                    count: { $sum: 1 }
                 }
             }
         ]);
         
         res.json({
-            success: true,
-            payments,
-            summary: summary[0] || {
-                totalPaid: 0,
-                totalPending: 0,
-                totalPayments: 0,
-                lastPayment: null
-            }
+            thisMonth: thisMonthPayments[0] || { total: 0, count: 0 },
+            lastMonth: lastMonthPayments[0] || { total: 0, count: 0 }
         });
-        
     } catch (error) {
-        console.error('Error obteniendo historial:', error);
-        res.status(500).json({ msg: 'Error del servidor' });
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
+    }
+};
+// Procesar pago (marcar como pagado)
+exports.processPayment = async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ errors: errors.array() });
+        }
+
+        const { paymentMethod, transactionId, amount, notes } = req.body;
+        
+        const payment = await Payment.findById(req.params.id);
+        if (!payment) {
+            return res.status(404).json({ msg: 'Pago no encontrado' });
+        }
+
+        payment.status = 'completed';
+        payment.paymentMethod = paymentMethod;
+        payment.transactionId = transactionId;
+        payment.paymentDate = new Date();
+        if (amount) payment.amount = amount;
+        if (notes) payment.notes = notes;
+
+        await payment.save();
+        await payment.populate('client', 'name email');
+        
+        res.json(payment);
+    } catch (error) {
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
+    }
+};
+
+// Agregar pago parcial
+exports.addPartialPayment = async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ errors: errors.array() });
+        }
+
+        const { amount, paymentMethod, transactionId, notes } = req.body;
+        
+        const payment = await Payment.findById(req.params.id);
+        if (!payment) {
+            return res.status(404).json({ msg: 'Pago no encontrado' });
+        }
+
+        // Agregar el pago parcial
+        payment.partialPayments = payment.partialPayments || [];
+        payment.partialPayments.push({
+            amount,
+            paymentMethod,
+            transactionId,
+            paymentDate: new Date(),
+            notes
+        });
+
+        // Actualizar estado si se completó
+        const totalPaid = payment.partialPayments.reduce((sum, partial) => sum + partial.amount, 0);
+        if (totalPaid >= payment.amount) {
+            payment.status = 'completed';
+        } else {
+            payment.status = 'partial';
+        }
+
+        await payment.save();
+        await payment.populate('client', 'name email');
+        
+        res.json(payment);
+    } catch (error) {
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
+    }
+};
+
+// Procesar reembolso
+exports.processRefund = async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ errors: errors.array() });
+        }
+
+        const { amount, reason } = req.body;
+        
+        const payment = await Payment.findById(req.params.id);
+        if (!payment) {
+            return res.status(404).json({ msg: 'Pago no encontrado' });
+        }
+
+        payment.status = 'refunded';
+        payment.refundAmount = amount || payment.amount;
+        payment.refundReason = reason;
+        payment.refundDate = new Date();
+
+        await payment.save();
+        await payment.populate('client', 'name email');
+        
+        res.json(payment);
+    } catch (error) {
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
+    }
+};
+
+// Obtener pagos vencidos
+exports.getOverduePayments = async (req, res) => {
+    try {
+        const overduePayments = await Payment.find({
+            status: 'pending',
+            dueDate: { $lt: new Date() }
+        })
+        .populate('client', 'name email')
+        .populate('service', 'plan monthlyCost')
+        .sort({ dueDate: 1 });
+
+        res.json({
+            success: true,
+            count: overduePayments.length,
+            payments: overduePayments
+        });
+    } catch (error) {
+        console.error(error.message);
+        res.status(500).send('Error del servidor');
     }
 };
